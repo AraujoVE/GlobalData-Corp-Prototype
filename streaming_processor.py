@@ -2,6 +2,7 @@ import re
 import json
 import logging
 import threading
+from datetime import datetime, timezone
 from utils import getProjectId
 import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions
@@ -53,8 +54,7 @@ bronzeSilverSchema = {
         {"name": "device_os", "type": "STRING", "mode": "NULLABLE"},
         {"name": "device_ip", "type": "STRING", "mode": "NULLABLE"},
         {"name": "status", "type": "STRING", "mode": "NULLABLE"},
-        {"name": "risk_classification", "type": "STRING", "mode": "NULLABLE"},
-        {"name": "processed_at", "type": "STRING", "mode": "NULLABLE"}
+        {"name": "processed_at", "type": "TIMESTAMP", "mode": "NULLABLE"}
     ]
 }
 
@@ -63,7 +63,8 @@ goldSchema = {
         {"name": "transaction_id", "type": "STRING", "mode": "REQUIRED"},
         {"name": "amount", "type": "FLOAT", "mode": "NULLABLE"},
         {"name": "status", "type": "STRING", "mode": "NULLABLE"},
-        {"name": "processed_at", "type": "STRING", "mode": "NULLABLE"}
+        {"name": "processed_at", "type": "TIMESTAMP", "mode": "NULLABLE"},
+        {"name": "risk_classification", "type": "STRING", "mode": "NULLABLE"},
     ]
 }
 
@@ -90,7 +91,8 @@ class ProcessTransactionPipeline(beam.DoFn):
             companyId = data.get("company_id", "")
             deviceId = data.get("device_id", "")
             
-            timestampNow = beam.utils.timestamp.Timestamp.now().to_utc_datetime().isoformat()
+            timestampNow = datetime.now(timezone.utc).isoformat()
+
             
             isRisky = (float(amount) > 4000.0 or status == "FRAUD_SUSPECT")
             riskClassification = "HIGH_PURCHASE" if float(amount) > 4000.0 else "FRAUD_SUSPECT"

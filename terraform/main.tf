@@ -299,121 +299,408 @@ resource "google_bigquery_table" "streaming_gold_table" {
 resource "google_workflows_workflow" "batch_orchestration" {
   name        = "globaldata-batch-pipeline"
   region      = var.gcp_region
-  description = "Orquestra a carga batch usando tabelas temporarias efemeras do BigQuery"
-  depends_on = [google_project_service.workflows_api]
+  description = "Pipeline batch Bronze, Silver e Gold com validacao e transacao BigQuery"
+
+  depends_on = [
+    google_project_service.workflows_api
+  ]
 
   source_contents = <<-EOF
     main:
       steps:
+
         - logStart:
             call: sys.log
             args:
-              text: "Iniciando pipeline batch com tabelas temporarias efemeras..."
+              text: "Iniciando pipeline batch Bronze -> Silver -> Gold"
 
-        - step1_loadGcsToTempStaging:
-            try:
-              call: googleapis.bigquery.v2.jobs.insert
-              args:
-                projectId: ${var.gcp_project_id}
-                body:
-                  configuration:
-                    load:
-                      sourceUris: ["gs://${var.gcp_project_id}-storage-bucket/batch-incoming/transactions_batch.parquet"]
-                      destinationTable:
-                        projectId: ${var.gcp_project_id}
-                        datasetId: "globaldata_bronze"
-                        tableId: "batch_transaction_raw_staging"
-                      sourceFormat: "PARQUET"
-                      writeDisposition: "WRITE_TRUNCATE"
-            except:
-              as: e
-              steps:
-                - checkLoadError:
-                    switch:
-                      - condition: '$${e.code == 404}'
-                        call: sys.log
-                        args:
-                          text: "Nenhum arquivo batch encontrado no GCS. Prosseguindo ciclo..."
-                      - condition: '$${true}'
-                        raise: $${e}
-
-        - step2_processAndAppendBronze:
+        - step1_loadGcsToStaging:
             call: googleapis.bigquery.v2.jobs.insert
             args:
               projectId: ${var.gcp_project_id}
               body:
                 configuration:
-                  jobType: "QUERY"
+                  load:
+                    sourceUris:
+                      - "gs://${var.gcp_project_id}-storage-bucket/batch-incoming/transactions_batch.parquet"
+
+                    destinationTable:
+                      projectId: ${var.gcp_project_id}
+                      datasetId: "globaldata_bronze"
+                      tableId: "batch_transaction_raw_staging"
+
+                    sourceFormat: "PARQUET"
+                    writeDisposition: "WRITE_TRUNCATE"
+            result: loadJob
+
+        - logLoadSuccess:
+            call: sys.log
+            args:
+              text: '$${"Carga GCS -> Staging concluida. Job: " + loadJob.jobReference.jobId}'
+
+        - step2_processBatch:
+            call: googleapis.bigquery.v2.jobs.insert
+            args:
+              projectId: ${var.gcp_project_id}
+              body:
+                configuration:
                   query:
+                    useLegacySql: false
+
                     query: |
-                      INSERT INTO `${var.gcp_project_id}.globaldata_bronze.batch_transaction_raw`
-                      SELECT * EXCEPT(rn, processed_at_temp), CURRENT_TIMESTAMP() AS processed_at FROM (
-                        SELECT *, 
-                            CURRENT_TIMESTAMP() AS processed_at_temp,
-                            ROW_NUMBER() OVER(PARTITION BY transaction_id ORDER BY transaction_timestamp DESC) as rn
+
+                      ASSERT (
+                        SELECT COUNT(*) > 0
                         FROM `${var.gcp_project_id}.globaldata_bronze.batch_transaction_raw_staging`
-                      ) WHERE rn = 1;
-                    useLegacySql: false
+                      ) AS 'STAGING_VAZIA: Nenhum registro encontrado.';
 
-        - step2_processAndAppendSilver:
-            call: googleapis.bigquery.v2.jobs.insert
-            args:
-              projectId: ${var.gcp_project_id}
-              body:
-                configuration:
-                  jobType: "QUERY"
-                  query:
-                    query: |
-                      INSERT INTO `${var.gcp_project_id}.globaldata_silver.batch_transaction`
-                      SELECT 
-                        transaction_id, transaction_timestamp, transaction_type, transaction_partner_id,
-                        client_company_id, client_id, client_company_account_id, client_account_id,
-                        client_name_pii, client_country_pii, client_document_pii,
-                        company_id, company_name, company_country, company_type,
-                        product_type, amount, currency, device_id, device_os, device_ip, status,
+                      CREATE TEMP TABLE batch_dedup AS
+
+                      SELECT
+                        transaction_id,
+                        transaction_timestamp,
+                        transaction_type,
+                        transaction_partner_id,
+                        client_company_id,
+                        client_id,
+                        client_company_account_id,
+                        client_account_id,
+                        client_name_pii,
+                        client_country_pii,
+                        client_document_pii,
+                        company_id,
+                        company_name,
+                        company_country,
+                        company_type,
+                        product_type,
+                        amount,
+                        currency,
+                        device_id,
+                        device_os,
+                        device_ip,
+                        status,
                         CURRENT_TIMESTAMP() AS processed_at
-                      FROM (
-                        SELECT *, ROW_NUMBER() OVER(PARTITION BY transaction_id ORDER BY transaction_timestamp DESC) as rn
-                        FROM `${var.gcp_project_id}.globaldata_bronze.batch_transaction_raw_staging`
-                      )
-                      WHERE rn = 1
-                        AND status IN ('APPROVED', 'DECLINED', 'PENDING', 'FRAUD_SUSPECT')
-                        AND transaction_type IN ('PURCHASE', 'REFUND', 'TRANSFER', 'SUBSCRIPTION')
-                        AND product_type IN ('DIGITAL_GOODS', 'PHYSICAL_GOODS', 'SERVICE', 'SOFTWARE', 'OTHERS')
-                        AND device_os IN ('Android', 'iOS', 'Windows', 'MacOS', 'Linux', 'Other')
-                        AND REGEXP_CONTAINS(transaction_partner_id, r'^cli_\\d{10}$')
-                        AND REGEXP_CONTAINS(client_id, r'^cli_\\d{10}$')
-                        AND REGEXP_CONTAINS(client_account_id, r'^acc_cli_\\d{10}$')
-                        AND REGEXP_CONTAINS(company_id, r'^comp_\\d{5}$')
-                        AND REGEXP_CONTAINS(device_id, r'^dev_\\d+$');
-                    useLegacySql: false
 
-        - step2_processAndAppendGold:
-            call: googleapis.bigquery.v2.jobs.insert
+                      FROM `${var.gcp_project_id}.globaldata_bronze.batch_transaction_raw_staging`
+
+                      QUALIFY ROW_NUMBER() OVER (
+                        PARTITION BY transaction_id
+                        ORDER BY transaction_timestamp DESC
+                      ) = 1;
+
+                      CREATE TEMP TABLE batch_valid AS
+
+                      SELECT *
+
+                      FROM batch_dedup
+
+                      WHERE
+                        status IN (
+                          'APPROVED',
+                          'DECLINED',
+                          'PENDING',
+                          'FRAUD_SUSPECT'
+                        )
+
+                        AND transaction_type IN (
+                          'PURCHASE',
+                          'REFUND',
+                          'TRANSFER',
+                          'SUBSCRIPTION'
+                        )
+
+                        AND product_type IN (
+                          'DIGITAL_GOODS',
+                          'PHYSICAL_GOODS',
+                          'SERVICE',
+                          'SOFTWARE',
+                          'OTHERS'
+                        )
+
+                        AND device_os IN (
+                          'Android',
+                          'iOS',
+                          'Windows',
+                          'MacOS',
+                          'Linux',
+                          'Other'
+                        )
+
+                        AND REGEXP_CONTAINS(
+                          transaction_partner_id,
+                          r'^cli_[0-9]{10}$'
+                        )
+
+                        AND REGEXP_CONTAINS(
+                          client_id,
+                          r'^cli_[0-9]{10}$'
+                        )
+
+                        AND REGEXP_CONTAINS(
+                          client_account_id,
+                          r'^acc_cli_[0-9]{10}$'
+                        )
+
+                        AND REGEXP_CONTAINS(
+                          company_id,
+                          r'^comp_[0-9]{5}$'
+                        )
+
+                        AND REGEXP_CONTAINS(
+                          device_id,
+                          r'^dev_[0-9]+$'
+                        );
+
+                      BEGIN TRANSACTION;
+
+
+                      MERGE `${var.gcp_project_id}.globaldata_bronze.batch_transaction_raw` AS target
+
+                      USING batch_dedup AS source
+
+                      ON target.transaction_id = source.transaction_id
+
+                      WHEN MATCHED AND
+                        source.transaction_timestamp > target.transaction_timestamp
+                      THEN UPDATE SET
+
+                        transaction_timestamp = source.transaction_timestamp,
+                        transaction_type = source.transaction_type,
+                        transaction_partner_id = source.transaction_partner_id,
+                        client_company_id = source.client_company_id,
+                        client_id = source.client_id,
+                        client_company_account_id = source.client_company_account_id,
+                        client_account_id = source.client_account_id,
+                        client_name_pii = source.client_name_pii,
+                        client_country_pii = source.client_country_pii,
+                        client_document_pii = source.client_document_pii,
+                        company_id = source.company_id,
+                        company_name = source.company_name,
+                        company_country = source.company_country,
+                        company_type = source.company_type,
+                        product_type = source.product_type,
+                        amount = source.amount,
+                        currency = source.currency,
+                        device_id = source.device_id,
+                        device_os = source.device_os,
+                        device_ip = source.device_ip,
+                        status = source.status,
+                        processed_at = source.processed_at
+
+                      WHEN NOT MATCHED THEN
+
+                        INSERT (
+                          transaction_id,
+                          transaction_timestamp,
+                          transaction_type,
+                          transaction_partner_id,
+                          client_company_id,
+                          client_id,
+                          client_company_account_id,
+                          client_account_id,
+                          client_name_pii,
+                          client_country_pii,
+                          client_document_pii,
+                          company_id,
+                          company_name,
+                          company_country,
+                          company_type,
+                          product_type,
+                          amount,
+                          currency,
+                          device_id,
+                          device_os,
+                          device_ip,
+                          status,
+                          processed_at
+                        )
+
+                        VALUES (
+                          source.transaction_id,
+                          source.transaction_timestamp,
+                          source.transaction_type,
+                          source.transaction_partner_id,
+                          source.client_company_id,
+                          source.client_id,
+                          source.client_company_account_id,
+                          source.client_account_id,
+                          source.client_name_pii,
+                          source.client_country_pii,
+                          source.client_document_pii,
+                          source.company_id,
+                          source.company_name,
+                          source.company_country,
+                          source.company_type,
+                          source.product_type,
+                          source.amount,
+                          source.currency,
+                          source.device_id,
+                          source.device_os,
+                          source.device_ip,
+                          source.status,
+                          source.processed_at
+                        );
+
+
+                      MERGE `${var.gcp_project_id}.globaldata_silver.batch_transaction` AS target
+
+                      USING batch_valid AS source
+
+                      ON target.transaction_id = source.transaction_id
+
+                      WHEN MATCHED AND
+                        source.transaction_timestamp > target.transaction_timestamp
+                      THEN UPDATE SET
+
+                        transaction_timestamp = source.transaction_timestamp,
+                        transaction_type = source.transaction_type,
+                        transaction_partner_id = source.transaction_partner_id,
+                        client_company_id = source.client_company_id,
+                        client_id = source.client_id,
+                        client_company_account_id = source.client_company_account_id,
+                        client_account_id = source.client_account_id,
+                        client_name_pii = source.client_name_pii,
+                        client_country_pii = source.client_country_pii,
+                        client_document_pii = source.client_document_pii,
+                        company_id = source.company_id,
+                        company_name = source.company_name,
+                        company_country = source.company_country,
+                        company_type = source.company_type,
+                        product_type = source.product_type,
+                        amount = source.amount,
+                        currency = source.currency,
+                        device_id = source.device_id,
+                        device_os = source.device_os,
+                        device_ip = source.device_ip,
+                        status = source.status,
+                        processed_at = source.processed_at
+
+                      WHEN NOT MATCHED THEN
+
+                        INSERT (
+                          transaction_id,
+                          transaction_timestamp,
+                          transaction_type,
+                          transaction_partner_id,
+                          client_company_id,
+                          client_id,
+                          client_company_account_id,
+                          client_account_id,
+                          client_name_pii,
+                          client_country_pii,
+                          client_document_pii,
+                          company_id,
+                          company_name,
+                          company_country,
+                          company_type,
+                          product_type,
+                          amount,
+                          currency,
+                          device_id,
+                          device_os,
+                          device_ip,
+                          status,
+                          processed_at
+                        )
+
+                        VALUES (
+                          source.transaction_id,
+                          source.transaction_timestamp,
+                          source.transaction_type,
+                          source.transaction_partner_id,
+                          source.client_company_id,
+                          source.client_id,
+                          source.client_company_account_id,
+                          source.client_account_id,
+                          source.client_name_pii,
+                          source.client_country_pii,
+                          source.client_document_pii,
+                          source.company_id,
+                          source.company_name,
+                          source.company_country,
+                          source.company_type,
+                          source.product_type,
+                          source.amount,
+                          source.currency,
+                          source.device_id,
+                          source.device_os,
+                          source.device_ip,
+                          source.status,
+                          source.processed_at
+                        );
+
+
+                      MERGE `${var.gcp_project_id}.globaldata_gold.batch_transaction_suspicious` AS target
+
+                      USING (
+
+                        SELECT
+                          transaction_id,
+                          amount,
+                          status,
+
+                          CASE
+                            WHEN amount > 4000.0
+                              THEN 'HIGH_PURCHASE'
+
+                            WHEN status = 'FRAUD_SUSPECT'
+                              THEN 'FRAUD_SUSPECT'
+
+                            ELSE 'NORMAL'
+                          END AS risk_classification,
+
+                          processed_at
+
+                        FROM batch_valid
+
+                        WHERE
+                          amount > 4000.0
+                          OR status = 'FRAUD_SUSPECT'
+
+                      ) AS source
+
+                      ON target.transaction_id = source.transaction_id
+
+                      WHEN MATCHED THEN
+
+                        UPDATE SET
+                          amount = source.amount,
+                          status = source.status,
+                          risk_classification = source.risk_classification,
+                          processed_at = source.processed_at
+
+                      WHEN NOT MATCHED THEN
+
+                        INSERT (
+                          transaction_id,
+                          amount,
+                          status,
+                          risk_classification,
+                          processed_at
+                        )
+
+                        VALUES (
+                          source.transaction_id,
+                          source.amount,
+                          source.status,
+                          source.risk_classification,
+                          source.processed_at
+                        );
+
+                      -- =================================================
+                      -- CONFIRMAR TRANSACAO
+                      -- =================================================
+
+                      COMMIT TRANSACTION;
+
+            result: batchJob
+
+        - logBatchSuccess:
+            call: sys.log
             args:
-              projectId: ${var.gcp_project_id}
-              body:
-                configuration:
-                  jobType: "QUERY"
-                  query:
-                    query: |
-                      INSERT INTO `${var.gcp_project_id}.globaldata_gold.batch_transaction_suspicious`
-                      SELECT 
-                        transaction_id, 
-                        amount, 
-                        status, 
-                        CASE 
-                          WHEN amount > 4000.0 THEN 'HIGH_PURCHASE'
-                          WHEN status = 'FRAUD_SUSPECT' THEN 'FRAUD_SUSPECT'
-                          ELSE 'NORMAL'
-                        END AS risk_classification,
-                        CURRENT_TIMESTAMP() AS processed_at
-                      FROM `${var.gcp_project_id}.globaldata_silver.batch_transaction`
-                      WHERE processed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 MINUTE)
-                        AND (amount > 4000.0 OR status = 'FRAUD_SUSPECT');
-                    useLegacySql: false
+              text: '$${"Processamento Bronze/Silver/Gold concluido. Job: " + batchJob.jobReference.jobId}'
 
-        - step3_clearMainStaging:
+        - step3_clearStaging:
             call: googleapis.bigquery.v2.jobs.insert
             args:
               projectId: ${var.gcp_project_id}
@@ -424,28 +711,40 @@ resource "google_workflows_workflow" "batch_orchestration" {
                       TRUNCATE TABLE `${var.gcp_project_id}.globaldata_bronze.batch_transaction_raw_staging`;
                     useLegacySql: false
 
+        - logStagingClear:
+            call: sys.log
+            args:
+              text: "Staging limpa com sucesso."
+
         - step4_deleteProcessedFile:
             try:
               call: googleapis.storage.v1.objects.delete
               args:
                 bucket: "${var.gcp_project_id}-storage-bucket"
-                object: "batch-incoming/transactions_batch.parquet"
+                object: '$${text.url_encode("batch-incoming/transactions_batch.parquet")}'
             except:
               as: e
               steps:
-                - checkNotFound:
+                - checkDeleteError:
                     switch:
                       - condition: '$${e.code == 404}'
-                        call: sys.log
-                        args:
-                          text: "Arquivo já havia sido removido ou não encontrado no GCS. Prosseguindo..."
+                        steps:
+                          - logFileNotFound:
+                              call: sys.log
+                              args:
+                                text: "Arquivo nao encontrado no GCS durante a exclusao. O processamento no BigQuery foi concluido."
                       - condition: '$${true}'
                         raise: $${e}
 
         - logSuccess:
             call: sys.log
             args:
-              text: "Pipeline batch concluido com sucesso usando tabelas temporarias!"
+              text: "Pipeline batch concluido com sucesso!"
+
+        - finish:
+            return:
+              status: "SUCCESS"
+              message: "Bronze, Silver e Gold processadas com sucesso."
   EOF
 }
 

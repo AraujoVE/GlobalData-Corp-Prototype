@@ -1,67 +1,202 @@
-# Guia de Execução
+# Arquitetura da solução — GlobalData
 
-Este guia descreve os passos para que qualquer um possa localmente testar a tarefa desenvolvida.
+## Visão geral
 
-## Justificativas Arquiteturais (Decisões de Design)
+O projeto possui dois pipelines de transações: streaming, com Pub/Sub e Apache Beam, e batch, com arquivos Parquet no Cloud Storage. Os dados são organizados no BigQuery em camadas Bronze, Silver e Gold.
 
-Antes de iniciar os passos práticos, vale destacar o racional por trás de algumas decisões técnicas tomadas neste projeto:
+```mermaid
+flowchart LR
+    subgraph STREAM["Streaming — Pub/Sub + Apache Beam"]
+        direction TB
+        PUB["transaction_publisher.py<br/>Eventos JSON"]
+        TOPIC["Pub/Sub — tópico de transações"]
+        SUB["Pub/Sub — assinatura principal"]
+        BEAM["streaming_processor.py<br/>DirectRunner local<br/>Validação e roteamento"]
+        DLQT["Pub/Sub — tópico DLQ"]
+        DLQS["Pub/Sub — assinatura DLQ"]
+        DLQC["Apache Beam — consumidor DLQ"]
 
-* **Arquitetura Medallion (Bronze, Silver, Gold) em Streaming e Batch:**
-  * **Por que foi escolhido:** Separar os dados em camadas (`Raw/Bronze` para auditoria e histórico bruto, `Clean/Silver` para validações de formato/esquema e regras de integridade, e `Aggregated/Gold` para regras de negócio e detecção de fraude) garante rastreabilidade, reprocessamento seguro e isolamento de falhas.
-  * **Em detrimento de:** Manter uma única tabela monolítica (antipattern de *Data Swamp*), o que dificultaria a governança de dados, auditoria de falhas e aplicação de regras de mascaramento (PII).
+        PUB --> TOPIC --> SUB --> BEAM
+        SUB -.->|Até 5 tentativas de entrega| DLQT
+        DLQT --> DLQS --> DLQC
+    end
 
-* **Cloud Workflows + Cloud Scheduler (para o Batch) vs. Ferramentas pesadas (ex: Airflow):**
-  * **Por que foi escolhido:** O Google Cloud Workflows combinado com o Cloud Scheduler é totalmente serverless, possui baixo custo, alta resiliência nativa e dispensa a manutenção de servidores ou clusters de orquestração (como o Airflow/Cloud Composer) para um pipeline orientado a arquivos parquet de menor escala.
-  * **Em detrimento de:** Cloud Composer / Apache Airflow, que introduz custos fixos elevados e sobrecarga operacional desnecessária para fluxos orientados a eventos/arquivos simples baseados em etapas sequenciais no BigQuery.
+    subgraph BATCH["Batch — Cloud Storage + Workflows"]
+        direction TB
+        CREATE["create_batch_data.py<br/>Gera Parquet"]
+        UPLOAD["upload_batch.py"]
+        GCS["Cloud Storage<br/>batch-incoming/transactions_batch.parquet"]
+        SCHED["Cloud Scheduler<br/>A cada 5 minutos"]
+        WF["Cloud Workflows<br/>globaldata-batch-pipeline"]
+        STAGING["BigQuery — staging<br/>batch_transaction_raw_staging"]
+        SCRIPT["BigQuery — SQL do lote<br/>Deduplicação + validação<br/>MERGE em transação"]
 
-* **Apache Beam / DirectRunner (para o Streaming):**
-  * **Por que foi escolhido:** O Apache Beam desacopla a lógica de processamento do motor de execução (`DirectRunner` para desenvolvimento/local e `DataflowRunner` para escala em nuvem), permitindo consistência no código de streaming e resiliência com Dead Letter Queue (DLQ) para mensagens corrompidas.
-  * **Em detrimento de:** Scripts Python customizados com loops infinitos consumindo Pub/Sub (`while True`), que carecem de paralelismo nativo, tratamento estruturado de janela de tempo e tolerância a falhas distribuídas.
+        CREATE --> UPLOAD --> GCS --> STAGING --> SCRIPT
+        SCHED -.->|Aciona| WF
+        WF -.->|Job de carga| STAGING
+        WF -.->|Depois do commit: TRUNCATE| STAGING
+        WF -.->|Após processamento: exclusão| GCS
+    end
 
-* **Governança de Dados com Policy Tags (Dataplex / Data Catalog):**
-  * **Por que foi escolhido:** Proteção nativa de colunas sensíveis (PII como `client_name_pii` e `client_document_pii`) direto no BigQuery, garantindo conformidade com LGPD/GDPR sem duplicar dados para mascaramento.
+    subgraph MEDALLION["BigQuery — arquitetura Medallion"]
+        direction LR
+        subgraph BRONZE["Bronze — globaldata_bronze"]
+            direction TB
+            BSTR["streaming_transaction_raw"]
+            BBAT["batch_transaction_raw"]
+            BDLQ["streaming_transaction_dlq"]
+        end
+        subgraph SILVER["Silver — globaldata_silver"]
+            direction TB
+            SSTR["streaming_transaction"]
+            SBAT["batch_transaction"]
+        end
+        subgraph GOLD["Gold — globaldata_gold"]
+            direction TB
+            GSTR["streaming_transaction_suspicious"]
+            GBAT["batch_transaction_suspicious"]
+        end
+    end
 
----
+    subgraph GOV["Governança e acesso"]
+        direction TB
+        PII["Data Catalog<br/>Policy Tag: Confidential PII"]
+        ACCESS["IAM<br/>Permissões e identidades"]
+    end
 
-## Atributos e Estrutura das Tabelas no BigQuery
+    BEAM -->|Dados recebidos| BSTR
+    BEAM -->|Registros válidos| SSTR
+    BEAM -->|Transações suspeitas| GSTR
+    BEAM -->|Erros estruturais| BDLQ
+    DLQC -->|Falhas de entrega| BDLQ
 
-As tabelas do pipeline seguem o padrão da Arquitetura Medallion, divididas entre os fluxos de Streaming e Batch, além do tratamento de erros (DLQ):
+    SCRIPT -->|MERGE| BBAT
+    SCRIPT -->|MERGE| SBAT
+    SCRIPT -->|MERGE| GBAT
 
-1. **Camada Bronze (Dados Brutos)**
-   * **Tabelas:** `streaming_transaction_raw`, `batch_transaction_raw`, `streaming_transaction_dlq`
-   * **Atributos principais:** Contêm todos os campos originais da transação sem tratamento de filtragem severa, preservando dados cadastrais, informações de dispositivo, valores e metadados de ingestão.
-   * **Atributos de controle:** `processed_at` (Timestamp que registra o momento da ingestão na camada).
-   * **Segurança:** As colunas sensíveis de PII (`client_name_pii`, `client_document_pii`) possuem Policy Tags aplicadas via Data Catalog para mascaramento e restrição de acesso granular.
+    PII -.->|Restringe PII| BSTR
+    PII -.->|Restringe PII| BBAT
+    ACCESS -.->|Execução| WF
+```
 
-2. **Camada Silver (Dados Limpos e Validados)**
-   * **Tabelas:** `streaming_transaction`, `batch_transaction`
-   * **Atributos principais:** Mantém o esquema estrutural completo da transação (IDs, valores, datas, tipos de produtos, canais e dados geográficos/dispositivos).
-   * **Regras aplicadas:** Somente registros que passam pelas validações de formato (regex para IDs padronizados), status válidos (`APPROVED`, `DECLINED`, `PENDING`, `FRAUD_SUSPECT`) e tipos permitidos avançam para esta camada.
+No streaming, o Beam envia os dados diretamente para cada camada do BigQuery. No batch, o processamento é feito com SQL e MERGE, após a carga do arquivo em uma tabela de staging.
 
-3. **Camada Gold (Agregações e Regras de Risco)**
-   * **Tabelas:** `streaming_transaction_suspicious`, `batch_transaction_suspicious`
-   * **Atributos principais:** Focada em analítica de risco e fraude. Armazena um subconjunto enxuto e otimizado contendo `transaction_id`, `amount`, `status`, `risk_classification` (ex: `HIGH_PURCHASE`, `FRAUD_SUSPECT`) e o `processed_at`.
+## Componentes e escolhas
 
----
+| Tecnologia | Uso no projeto | Motivo da escolha |
+| --- | --- | --- |
+| Arquitetura Medallion | Separação entre Bronze, Silver e Gold. | Organiza os dados recebidos, os registros válidos e as transações suspeitas. |
+| Pub/Sub | Recebimento das transações em streaming. | Separa a publicação dos eventos do seu processamento. |
+| Apache Beam / DirectRunner | Processamento do streaming no ambiente local. | Permite validação, janelas e deduplicação sem precisar executar o Dataflow. |
+| Cloud Storage / Parquet | Entrada dos arquivos batch. | Facilita o armazenamento e o carregamento de lotes no BigQuery. |
+| Cloud Scheduler / Workflows | Execução do batch a cada cinco minutos. | Automatiza as etapas sem precisar manter um servidor de orquestração. |
+| BigQuery | Armazenamento e transformações SQL. | Centraliza os dados e permite consultas e atualizações com MERGE. |
+| Policy Tags / IAM | Controle de acesso a campos pessoais. | Restringe a visualização de colunas sensíveis. |
+| Terraform / Docker | Infraestrutura e ambiente de testes. | Facilita a configuração e a reprodução do projeto. |
 
-## Pré-requisitos e Passos para Execução
+O DirectRunner foi mantido por ser suficiente para os testes. Em um ambiente de produção, seria possível executar o mesmo modelo de processamento em um serviço gerenciado como o Dataflow.
 
-Os passos abaixo devem ser seguidos em ordem:
+## Como funcionam os pipelines
 
-1. **Ter Docker**
-   * **Motivação:** O Docker foi escolhido pois com ele é possível executar todo o processo em um ambiente controlado, sem que o avaliador ou qualquer outra pessoa precise instalar certas dependências em seu espaço pessoal do computador.
+### Streaming
 
-2. **`chmod +x start-dev.sh`**
-   * **O porquê:** Esse comando permite que o script seja rodado e com isso todo o processo seja desencadeado.
+1. transaction_publisher.py publica transações JSON no Pub/Sub.
+2. streaming_processor.py consome as mensagens com Apache Beam.
+3. Registros com a estrutura mínima necessária vão para a Bronze. Os que passam pelas validações também vão para a Silver.
+4. Transações válidas com amount > 4000 ou status = 'FRAUD_SUSPECT' também são enviadas à Gold.
+5. Erros de processamento são registrados na tabela streaming_transaction_dlq. Há também uma assinatura DLQ do Pub/Sub para falhas de entrega.
 
-3. **`./start-dev.sh`**
-   * **O que faz:** Esse script é responsável por iniciar o Docker e dar a permissão para os outros scripts.
+O Beam deduplica por transaction_id em janelas de 60 segundos. Essa deduplicação não impede repetições entre janelas diferentes.
 
-4. **`./setup.sh`**
-   * **O processo principal:** Com esse script a lógica de definição principal do sistema ocorre. Primeiro é checado se o usuário está autenticado, caso contrário ocorre a autenticação, que requer copiar um link do terminal e, após validar, colar o link gerado pelo autenticador. Após isso, o Terraform é iniciado, definindo todas as regras necessárias. Por fim o streaming_processor.py é executado no terminal de fundo, assim é possível continuar fazendo as outras operações sem que sejam atrapalhadas.
+### Batch
 
-5. **`python3 transaction_publisher.py`**
-   * **Testando o streaming:** Esse script simula e publica transações de teste em tempo real para validar o fluxo de streaming do pipeline.
+1. create_batch_data.py gera batch_data.parquet e upload_batch.py envia o arquivo ao Cloud Storage.
+2. O Cloud Scheduler aciona o workflow a cada cinco minutos.
+3. O Workflows carrega o Parquet na tabela batch_transaction_raw_staging.
+4. O BigQuery deduplica e valida os registros e executa MERGE nas tabelas Bronze, Silver e Gold.
+5. Após o processamento, o workflow limpa a staging e tenta excluir o arquivo do bucket.
 
-6. **`python3 upload_batch.py`**
-   * **Testando o batch:** A lógica de batch é controlada pelo terraform, contudo para que os dados possam ser lidos é preciso que eles sejam adicionados ao local de acesso do terraform. O upload_batch.py move o arquivo batch_data.parquet, que foi gerado pelo create_batch_data.py, para o caminho ideal, e quando isso é feito ele passa a ser acessível e quando o cron do google_cloud_scheduler_job for executado, a cada 5 minutos, os dados serão movidos para as tabelas no BQ.
+A deduplicação do batch considera o transaction_id e seleciona o registro com maior transaction_timestamp dentro do lote.
+
+## Tabelas do BigQuery
+
+| Camada | Streaming | Batch |
+| --- | --- | --- |
+| Bronze | globaldata_bronze.streaming_transaction_raw | globaldata_bronze.batch_transaction_raw |
+| Silver | globaldata_silver.streaming_transaction | globaldata_silver.batch_transaction |
+| Gold | globaldata_gold.streaming_transaction_suspicious | globaldata_gold.batch_transaction_suspicious |
+
+Outras tabelas utilizadas:
+
+- globaldata_bronze.batch_transaction_raw_staging: recebe temporariamente os dados carregados do arquivo Parquet.
+- globaldata_bronze.streaming_transaction_dlq: guarda mensagens com erros de processamento ou entrega.
+
+A Gold contém transações classificadas como suspeitas; não é uma tabela de agregações. Os campos pessoais, como client_name_pii e client_document_pii, utilizam Policy Tags para controle de acesso.
+
+## Como executar
+
+### 1. Configurar o projeto
+
+Antes de iniciar, abra terraform/variables.tf e ajuste:
+
+- PROJECT_ID: ID do seu projeto no Google Cloud.
+- PROJECT_NUMBER: número do mesmo projeto no Google Cloud.
+- examiner_email: e-mail usado para testar as permissões. Pode ser deixado vazio inicialmente e preenchido depois.
+
+Quando alterar examiner_email, execute novamente terraform plan e terraform apply para atualizar as permissões. O valor vazio só funcionará se os recursos IAM estiverem configurados para ignorar esse vínculo; confira o plano do Terraform.
+
+É necessário ter Docker instalado, acesso a um projeto Google Cloud e permissões para criar os recursos.
+
+### 2. Iniciar o Docker
+
+Na pasta do projeto, execute:
+
+```bash
+chmod +x start-dev.sh setup.sh
+./start-dev.sh
+```
+
+O script inicia o contêiner com o ambiente necessário. Os comandos seguintes são executados dentro dele.
+
+### 3. Configurar a infraestrutura e iniciar o streaming
+
+```bash
+./setup.sh
+```
+
+O script autentica no Google Cloud, aplica o Terraform e inicia streaming_processor.py em segundo plano.
+
+Para acompanhar os logs:
+
+```bash
+tail -f processor.log
+```
+
+### 4. Testar o streaming
+
+```bash
+python3 transaction_publisher.py
+```
+
+O script publica transações de teste. Confira os resultados nas tabelas Bronze, Silver, Gold e DLQ do streaming no BigQuery. As gravações podem levar algum tempo por causa das janelas de processamento.
+
+### 5. Testar o batch
+
+```bash
+python3 create_batch_data.py
+python3 upload_batch.py
+```
+
+O primeiro comando gera o arquivo Parquet; o segundo faz o upload para gs://<PROJECT_ID>-storage-bucket/batch-incoming/transactions_batch.parquet.
+
+O Cloud Scheduler executa o workflow a cada cinco minutos. Depois, confira as tabelas batch no BigQuery e o histórico no Cloud Workflows.
+
+### 6. Encerrar os testes
+
+Encerre o processo de streaming e o contêiner quando terminar. Os recursos criados no Google Cloud, incluindo o agendamento do Scheduler, continuam ativos até serem pausados ou removidos.
+
+## Observações
+
+- O streaming roda localmente com DirectRunner, não no Dataflow.
+- A deduplicação do streaming vale apenas dentro de cada janela de 60 segundos.
+- O batch utiliza um caminho fixo no Cloud Storage e uma staging compartilhada; execuções simultâneas podem causar conflito.
